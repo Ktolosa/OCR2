@@ -8,6 +8,7 @@ import json
 import time
 import base64
 import io
+from datetime import date # Para la fecha en el nombre del archivo
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Nexus Extractor (Motor Groq)", layout="wide")
@@ -21,7 +22,7 @@ else:
     st.stop()
 
 # ==========================================
-# 🧠 DEFINICIÓN DE PROMPTS (CON ORIGEN EN GOODYEAR)
+# 🧠 DEFINICIÓN DE PROMPTS
 # ==========================================
 PROMPTS_POR_TIPO = {
     "Factura Internacional (Regal/General)": """
@@ -45,19 +46,11 @@ PROMPTS_POR_TIPO = {
         
         INSTRUCCIONES CRÍTICAS DE LECTURA:
         1. NÚMERO DE FACTURA:
-           - Busca "INVOICE NUMBER" (ej: 300098911).
-           - IMPORTANTE: Si en esta página NO aparece el texto "INVOICE NUMBER", devuelve null o "CONTINUACION".
+           - Busca "INVOICE NUMBER". Si NO aparece en esta página, devuelve null o "CONTINUACION".
 
         2. TABLA DE ITEMS:
-           - Mapeo de columnas:
-             'Code' -> modelo
-             'Origin' -> origen (IMPORTANTE: Extraer el país, ej: Brazil)
-             'Description' -> descripcion
-             'Qty' -> cantidad
-             'Unit Value' -> precio_unitario
-           
-           - MANEJO DE SALTOS DE LÍNEA (Páginas rotas):
-             Si la info está en dos líneas (Linea A: Descripción, Linea B: Datos numéricos), únelas lógicamente.
+           - Mapeo: 'Code' -> modelo, 'Origin' -> origen (PAÍS COMPLETO), 'Description' -> descripcion, 'Qty' -> cantidad, 'Unit Value' -> precio_unitario.
+           - Si la info está rota en dos líneas, únelas lógicamente.
 
         Responde SOLAMENTE con este JSON:
         {
@@ -70,7 +63,7 @@ PROMPTS_POR_TIPO = {
             "items": [
                 {
                     "modelo": "...",
-                    "origen": "País de Origen (ej: Brazil)", 
+                    "origen": "País (ej: Brazil)", 
                     "descripcion": "...",
                     "cantidad": 0,
                     "precio_unitario": 0.00,
@@ -89,6 +82,71 @@ def codificar_imagen(image):
     buffered = io.BytesIO()
     image.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+def generar_excel_dpr(df_items, nombre_proveedor):
+    """
+    Genera un archivo Excel con formato DPR específico.
+    """
+    output = io.BytesIO()
+    
+    # --- CONFIGURACIÓN DE COLUMNAS DEL DPR ---
+    # AJUSTA ESTA LISTA CON LOS ENCABEZADOS EXACTOS DE TU CSV/DPR
+    # Mantén el orden exacto de tu archivo ejemplo.
+    columnas_dpr = [
+        "ITEM",           # A
+        "CODIGO",         # B (modelo)
+        "DESCRIPCION",    # C (descripcion)
+        "CANTIDAD",       # D (cantidad)
+        "PRECIO UNIT",    # E (precio_unitario)
+        "TOTAL",          # F (total_linea)
+        "ORIGEN",         # G (origen)
+        "TLC",            # H (Vacio)
+        "PESO NETO",      # I (Vacio)
+        "PESO BRUTO",     # J (Vacio)
+        "FACTURA",        # K
+        "OBSERVACIONES"   # L (Vacio)
+    ]
+    
+    # Creamos el escritor de Excel usando XlsxWriter
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        workbook = writer.book
+        worksheet = workbook.add_worksheet("DPR_DATA")
+        
+        # Formatos
+        header_format = workbook.add_format({'bold': True, 'bg_color': '#D3D3D3', 'border': 1})
+        
+        # 1. Escribir Encabezados
+        for col_num, value in enumerate(columnas_dpr):
+            worksheet.write(0, col_num, value, header_format)
+            
+        # 2. Escribir Datos
+        for row_num, item in enumerate(df_items.to_dict('records'), 1):
+            # Mapeo de datos extraídos a las columnas del DPR
+            # (Ajusta los índices si cambias el orden de columnas_dpr)
+            
+            worksheet.write(row_num, 0, row_num)                  # A: ITEM (Consecutivo)
+            worksheet.write(row_num, 1, item.get('modelo', ''))   # B: CODIGO
+            worksheet.write(row_num, 2, item.get('descripcion', '')) # C: DESCRIPCION
+            worksheet.write(row_num, 3, item.get('cantidad', 0))  # D: CANTIDAD
+            worksheet.write(row_num, 4, item.get('precio_unitario', 0)) # E: PRECIO
+            worksheet.write(row_num, 5, item.get('total_linea', 0)) # F: TOTAL
+            worksheet.write(row_num, 6, item.get('origen', ''))   # G: ORIGEN (Nuevo!)
+            worksheet.write(row_num, 7, "")                       # H: TLC (Vacío)
+            worksheet.write(row_num, 8, "")                       # I: PESO NETO (Vacío)
+            worksheet.write(row_num, 9, "")                       # J: PESO BRUTO (Vacío)
+            worksheet.write(row_num, 10, item.get('Factura_Origen', '')) # K: FACTURA
+            worksheet.write(row_num, 11, "")                      # L: OBS
+        
+        # 3. Ocultar Columnas (Si tu DPR tiene columnas ocultas, hazlo aquí)
+        # Ejemplo: Si la columna "TLC" (H -> indice 7) debe estar oculta:
+        # worksheet.set_column(7, 7, None, {'hidden': True}) 
+        
+        # Ajustar ancho de columnas básico
+        worksheet.set_column(0, 0, 5)  # Item
+        worksheet.set_column(1, 1, 15) # Codigo
+        worksheet.set_column(2, 2, 40) # Descripcion
+        
+    return output.getvalue()
 
 # ==========================================
 # 🧠 LÓGICA DE ANÁLISIS
@@ -150,19 +208,17 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
         else:
             factura_actual = str(data.get("numero_factura", "")).strip()
             
-            # Lógica de continuidad de factura
             if not factura_actual or factura_actual.lower() in ["none", "null", "continuacion", "pendiente"] or len(factura_actual) < 3:
                 factura_id = ultimo_numero_factura
             else:
                 factura_id = factura_actual
                 ultimo_numero_factura = factura_actual
 
-            # Guardamos Items (Ahora con Origen)
+            # Guardamos Items
             if "items" in data and isinstance(data["items"], list):
                 for item in data["items"]:
                     item["Archivo_Origen"] = filename
                     item["Factura_Origen"] = factura_id
-                    # Aseguramos que el campo exista aunque venga vacío
                     if "origen" not in item: item["origen"] = "" 
                     items_locales.append(item)
             
@@ -194,6 +250,10 @@ uploaded_files = st.file_uploader("Sube Facturas (PDF)", type=["pdf"], accept_mu
 
 if uploaded_files and st.button("🚀 Procesar con Groq"):
     gran_acumulado = []
+    
+    # Nombre del proveedor para el archivo (se basa en la selección)
+    nombre_proveedor_archivo = "Goodyear" if "Goodyear" in tipo_pdf else "Proveedor"
+    
     st.divider()
     for uploaded_file in uploaded_files:
         with st.expander(f"📄 {uploaded_file.name}", expanded=True):
@@ -209,16 +269,38 @@ if uploaded_files and st.button("🚀 Procesar con Groq"):
                 if items:
                     df = pd.DataFrame(items)
                     st.success(f"✅ {len(items)} items extraídos.")
-                    # Reordenar columnas para ver el origen mejor
-                    columnas = [c for c in df.columns if c not in ["Archivo_Origen", "Factura_Origen"]]
-                    st.dataframe(df[columnas + ["origen", "Archivo_Origen", "Factura_Origen"]], use_container_width=True)
+                    
+                    # Mostrar tabla
+                    cols_to_show = ["modelo", "descripcion", "cantidad", "precio_unitario", "origen", "Factura_Origen"]
+                    # Filtramos solo columnas que existan para evitar errores si cambia el prompt
+                    cols_finales = [c for c in cols_to_show if c in df.columns]
+                    st.dataframe(df[cols_finales], use_container_width=True)
+                    
                     gran_acumulado.extend(items)
                 elif error:
                     st.error(error)
                 else:
-                    st.warning("⚠️ Sin datos (Copia o vacío).")
+                    st.warning("⚠️ Sin datos.")
 
     if gran_acumulado:
         st.divider()
-        csv = pd.DataFrame(gran_acumulado).to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Descargar Todo (CSV)", csv, "extraccion_groq.csv", "text/csv")
+        st.subheader("📥 Zona de Descargas")
+        
+        # 1. Descarga CSV Estándar (Todo junto)
+        df_master = pd.DataFrame(gran_acumulado)
+        csv = df_master.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Descargar CSV Bruto", csv, "extraccion_raw.csv", "text/csv")
+        
+        # 2. Descarga DPR ESPECIAL (Solo si es Goodyear o se solicita)
+        if "Goodyear" in tipo_pdf:
+            fecha_hoy = date.today().strftime("%Y-%m-%d")
+            nombre_archivo_dpr = f"DPR_{nombre_proveedor_archivo}_{fecha_hoy}.xlsx"
+            
+            excel_data = generar_excel_dpr(df_master, nombre_proveedor_archivo)
+            
+            st.download_button(
+                label=f"📄 Descargar Formato DPR ({nombre_archivo_dpr})",
+                data=excel_data,
+                file_name=nombre_archivo_dpr,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
