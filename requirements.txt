@@ -3,3 +3,4 @@ pandas
 groq
 pdf2image
 pillow
+xlsxwriter
