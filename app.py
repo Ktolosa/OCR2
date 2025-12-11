@@ -11,7 +11,7 @@ import io
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Nexus Extractor (Motor Groq)", layout="wide")
-st.title("⚡ Nexus Extractor: Motor Llama 3.2 Vision (Groq)")
+st.title("⚡ Nexus Extractor: Motor Llama 4 Vision (Groq)")
 
 # 1. Configurar Cliente Groq
 if "GROQ_API_KEY" in st.secrets:
@@ -98,7 +98,7 @@ def analizar_pagina(image, prompt_sistema):
         # 1. Preparar imagen
         base64_image = codificar_imagen(image)
         
-        # 2. Llamada a la API de Groq (Llama 3.2 Vision)
+        # 2. Llamada a la API de Groq (MODELO ACTUALIZADO A LLAMA 4 SCOUT)
         chat_completion = client.chat.completions.create(
             messages=[
                 {
@@ -114,12 +114,14 @@ def analizar_pagina(image, prompt_sistema):
                     ],
                 }
             ],
-            model="llama-3.2-11b-vision-preview", # Modelo optimizado para visión
+            # --- AQUÍ ESTÁ EL CAMBIO IMPORTANTE ---
+            model="meta-llama/llama-4-scout-17b-16e-instruct", 
+            # --------------------------------------
             temperature=0.1,
-            max_tokens=2048,
+            max_tokens=4096, # Aumentado para respuestas largas
             top_p=1,
             stream=False,
-            response_format={"type": "json_object"}, # Forzamos respuesta JSON pura
+            response_format={"type": "json_object"}, 
         )
 
         # 3. Obtener respuesta
@@ -129,7 +131,11 @@ def analizar_pagina(image, prompt_sistema):
         return json.loads(texto_respuesta), None
 
     except Exception as e:
-        return {}, f"Error Groq: {str(e)}"
+        # Capturamos error para mostrarlo claro si vuelve a cambiar el modelo
+        error_msg = str(e)
+        if "model_decommissioned" in error_msg:
+            return {}, "⚠️ El modelo de IA ha cambiado. Revisa la documentación de Groq."
+        return {}, f"Error Groq: {error_msg}"
 
 # ==========================================
 # ⚙️ PROCESAMIENTO DE PDF
@@ -178,7 +184,6 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
         
         # Actualizar barra
         my_bar.progress((i + 1) / len(images))
-        # Groq es muy rápido, pero una pausa mínima evita rate-limits en cuentas nuevas
         time.sleep(0.5) 
 
     my_bar.empty()
@@ -190,7 +195,7 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
 with st.sidebar:
     st.header("Configuración")
     tipo_pdf = st.selectbox("Plantilla:", list(PROMPTS_POR_TIPO.keys()))
-    st.success("⚡ Motor Groq Activo")
+    st.success("⚡ Motor Groq (Llama 4 Vision)")
 
 uploaded_files = st.file_uploader("Sube Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
 
