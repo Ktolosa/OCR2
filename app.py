@@ -1,306 +1,162 @@
 import streamlit as st
 import pandas as pd
+import pdfplumber
 from groq import Groq
-from pdf2image import convert_from_path
-import tempfile
-import os
 import json
-import time
-import base64
-import io
-from datetime import date # Para la fecha en el nombre del archivo
+import re
+from io import BytesIO
 
-# --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Nexus Extractor (Motor Groq)", layout="wide")
-st.title("⚡ Nexus Extractor: Motor Llama 4 Vision (Groq)")
+# --- CONFIGURACIÓN DE LA PÁGINA ---
+st.set_page_config(page_title="Extractor Multi-Marca IA", layout="wide")
 
-# 1. Configurar Cliente Groq
-if "GROQ_API_KEY" in st.secrets:
-    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-else:
-    st.error("❌ Falta la API KEY de Groq. Configura 'GROQ_API_KEY' en secrets.")
-    st.stop()
+# --- FUNCIONES AUXILIARES ---
 
-# ==========================================
-# 🧠 DEFINICIÓN DE PROMPTS
-# ==========================================
-PROMPTS_POR_TIPO = {
-    "Factura Internacional (Regal/General)": """
-        Eres un experto en extracción de datos. Analiza la imagen de la factura.
-        REGLA DE FILTRADO:
-        1. Si el documento dice explícitamente "Duplicado" o "Copia", marca "tipo_documento" como "Copia" y deja "items" vacío.
-        2. Si dice "Original" o no especifica, extrae todo.
-        Responde SOLAMENTE con un JSON válido:
-        {"tipo_documento": "Original/Copia", "numero_factura": "Invoice #", "fecha": "YYYY-MM-DD", "orden_compra": "PO #", "proveedor": "Vendor Name", "cliente": "Sold To", "items": [{"modelo": "Model No", "descripcion": "Description", "cantidad": 0, "precio_unitario": 0.00, "total_linea": 0.00}], "total_factura": 0.00}
-    """,
-    "Factura RadioShack": """
-        Analiza esta factura de RadioShack. Extrae datos en JSON. Usa SKU como modelo.
-        JSON: {"tipo_documento": "Original", "numero_factura": "...", "fecha": "...", "proveedor": "RadioShack", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "total_linea": 0.0}], "total_factura": 0.0}
-    """,
-    "Factura Mabe": """
-        Analiza esta factura de Mabe. Extrae datos en JSON. Usa CODIGO MABE como modelo. Ignora impuestos.
-        JSON: {"tipo_documento": "Original", "numero_factura": "...", "fecha": "...", "proveedor": "Mabe", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "total_linea": 0.0}], "total_factura": 0.0}
-    """,
-    "Factura Goodyear": """
-        Analiza esta factura de Goodyear.
-        
-        INSTRUCCIONES CRÍTICAS DE LECTURA:
-        1. NÚMERO DE FACTURA:
-           - Busca "INVOICE NUMBER". Si NO aparece en esta página, devuelve null o "CONTINUACION".
+def extraer_texto_pdf(pdf_file):
+    """Convierte el PDF a texto plano respetando el layout visual"""
+    texto_completo = ""
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            texto_extraido = page.extract_text()
+            if texto_extraido:
+                texto_completo += f"--- PÁGINA {page.page_number} ---\n"
+                texto_completo += texto_extraido + "\n"
+    return texto_completo
 
-        2. TABLA DE ITEMS:
-           - Mapeo: 'Code' -> modelo, 'Origin' -> origen (PAÍS COMPLETO), 'Description' -> descripcion, 'Qty' -> cantidad, 'Unit Value' -> precio_unitario.
-           - Si la info está rota en dos líneas, únelas lógicamente.
+def limpiar_json_response(response_text):
+    """Limpia la respuesta de Groq para obtener solo el JSON válido"""
+    match = re.search(r'\[.*\]', response_text, re.DOTALL)
+    if match:
+        return match.group(0)
+    return response_text
 
-        Responde SOLAMENTE con este JSON:
-        {
-            "tipo_documento": "Original",
-            "numero_factura": "...",
-            "fecha": "...",
-            "orden_compra": "...",
-            "proveedor": "Goodyear International Corporation",
-            "cliente": "...",
-            "items": [
-                {
-                    "modelo": "...",
-                    "origen": "País (ej: Brazil)", 
-                    "descripcion": "...",
-                    "cantidad": 0,
-                    "precio_unitario": 0.00,
-                    "total_linea": 0.00
-                }
-            ],
-            "total_factura": 0.00
-        }
-    """
-}
-
-# ==========================================
-# 🛠️ FUNCIONES AUXILIARES
-# ==========================================
-def codificar_imagen(image):
-    buffered = io.BytesIO()
-    image.save(buffered, format="JPEG")
-    return base64.b64encode(buffered.getvalue()).decode('utf-8')
-
-def generar_excel_dpr(df_items, nombre_proveedor):
-    """
-    Genera un archivo Excel con formato DPR específico.
-    """
-    output = io.BytesIO()
+def consultar_groq(texto_pdf, api_key):
+    client = Groq(api_key=api_key)
     
-    # --- CONFIGURACIÓN DE COLUMNAS DEL DPR ---
-    # AJUSTA ESTA LISTA CON LOS ENCABEZADOS EXACTOS DE TU CSV/DPR
-    # Mantén el orden exacto de tu archivo ejemplo.
-    columnas_dpr = [
-        "ITEM",           # A
-        "CODIGO",         # B (modelo)
-        "DESCRIPCION",    # C (descripcion)
-        "CANTIDAD",       # D (cantidad)
-        "PRECIO UNIT",    # E (precio_unitario)
-        "TOTAL",          # F (total_linea)
-        "ORIGEN",         # G (origen)
-        "TLC",            # H (Vacio)
-        "PESO NETO",      # I (Vacio)
-        "PESO BRUTO",     # J (Vacio)
-        "FACTURA",        # K
-        "OBSERVACIONES"   # L (Vacio)
+    # ---------------------------------------------------------
+    # PROMPT ACTUALIZADO: INCLUYE DETECCIÓN DE MARCA (BRAND)
+    # ---------------------------------------------------------
+    prompt = f"""
+    Actúa como un experto analista de facturas e inventarios.
+    Tu objetivo es extraer una tabla estructurada de productos del siguiente texto de factura.
+
+    TEXTO DEL DOCUMENTO:
+    {texto_pdf}
+
+    INSTRUCCIONES CRÍTICAS PARA LA EXTRACCIÓN:
+    1. Debes generar un JSON con la lista de productos.
+    2. DETECCIÓN DE MARCA (NUEVO): Busca la marca del producto (ej: Goodyear, Regal, MABE, GE, Samsung).
+       - Si la marca aparece en el encabezado del documento (Logo o remitente) y no en cada línea, ASUME QUE APLICA PARA TODOS LOS ÍTEMS.
+       - Si la marca está en la descripción del ítem, extráela.
+    3. RELLENO DE ORIGEN: Si el país de origen (ej: Brazil, China, USA) aparece al inicio pero falta en las filas siguientes, rellénalo (Forward Fill).
+    4. FILAS ROTAS: Une descripciones cortadas por saltos de línea.
+
+    CAMPOS REQUERIDOS EN EL JSON:
+    - "marca": (Ej: Goodyear, Regal, Mabe. NO lo dejes vacío si el documento tiene logo).
+    - "cantidad": (Número).
+    - "modelo": (Código, SKU, Part Number).
+    - "descripcion": (Texto completo del producto).
+    - "precio_unitario": (Número).
+    - "origen": (Ej: Brazil, Mexico, USA).
+    - "factura_origen": (Número de factura si está disponible).
+
+    FORMATO DE SALIDA:
+    Devuelve SOLO una lista de objetos JSON. Ejemplo:
+    [
+      {{
+        "marca": "Goodyear",
+        "cantidad": 40,
+        "modelo": "111530",
+        "descripcion": "215/60R17 EFFIGRIP SUV",
+        "precio_unitario": 68.93,
+        "origen": "Brazil",
+        "factura_origen": "300098911"
+      }}
     ]
-    
-    # Creamos el escritor de Excel usando XlsxWriter
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        workbook = writer.book
-        worksheet = workbook.add_worksheet("DPR_DATA")
-        
-        # Formatos
-        header_format = workbook.add_format({'bold': True, 'bg_color': '#D3D3D3', 'border': 1})
-        
-        # 1. Escribir Encabezados
-        for col_num, value in enumerate(columnas_dpr):
-            worksheet.write(0, col_num, value, header_format)
-            
-        # 2. Escribir Datos
-        for row_num, item in enumerate(df_items.to_dict('records'), 1):
-            # Mapeo de datos extraídos a las columnas del DPR
-            # (Ajusta los índices si cambias el orden de columnas_dpr)
-            
-            worksheet.write(row_num, 0, row_num)                  # A: ITEM (Consecutivo)
-            worksheet.write(row_num, 1, item.get('modelo', ''))   # B: CODIGO
-            worksheet.write(row_num, 2, item.get('descripcion', '')) # C: DESCRIPCION
-            worksheet.write(row_num, 3, item.get('cantidad', 0))  # D: CANTIDAD
-            worksheet.write(row_num, 4, item.get('precio_unitario', 0)) # E: PRECIO
-            worksheet.write(row_num, 5, item.get('total_linea', 0)) # F: TOTAL
-            worksheet.write(row_num, 6, item.get('origen', ''))   # G: ORIGEN (Nuevo!)
-            worksheet.write(row_num, 7, "")                       # H: TLC (Vacío)
-            worksheet.write(row_num, 8, "")                       # I: PESO NETO (Vacío)
-            worksheet.write(row_num, 9, "")                       # J: PESO BRUTO (Vacío)
-            worksheet.write(row_num, 10, item.get('Factura_Origen', '')) # K: FACTURA
-            worksheet.write(row_num, 11, "")                      # L: OBS
-        
-        # 3. Ocultar Columnas (Si tu DPR tiene columnas ocultas, hazlo aquí)
-        # Ejemplo: Si la columna "TLC" (H -> indice 7) debe estar oculta:
-        # worksheet.set_column(7, 7, None, {'hidden': True}) 
-        
-        # Ajustar ancho de columnas básico
-        worksheet.set_column(0, 0, 5)  # Item
-        worksheet.set_column(1, 1, 15) # Codigo
-        worksheet.set_column(2, 2, 40) # Descripcion
-        
-    return output.getvalue()
+    """
 
-# ==========================================
-# 🧠 LÓGICA DE ANÁLISIS
-# ==========================================
-def analizar_pagina(image, prompt_sistema):
     try:
-        base64_image = codificar_imagen(image)
         chat_completion = client.chat.completions.create(
             messages=[
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt_sistema},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                        },
-                    ],
+                    "content": prompt,
                 }
             ],
-            model="meta-llama/llama-4-scout-17b-16e-instruct", 
-            temperature=0.1,
-            max_tokens=4096,
-            stream=False,
-            response_format={"type": "json_object"}, 
+            model="llama3-70b-8192", 
+            temperature=0.1, 
         )
-        texto_respuesta = chat_completion.choices[0].message.content
-        return json.loads(texto_respuesta), None
+        return chat_completion.choices[0].message.content
     except Exception as e:
-        if "model_decommissioned" in str(e):
-             return {}, "⚠️ Modelo antiguo. Contacta soporte."
-        return {}, f"Error Groq: {str(e)}"
+        return f"Error Groq: {str(e)}"
 
-# ==========================================
-# ⚙️ PROCESAMIENTO
-# ==========================================
-def procesar_pdf(pdf_path, filename, tipo_seleccionado):
-    prompt = PROMPTS_POR_TIPO[tipo_seleccionado]
-    try:
-        images = convert_from_path(pdf_path, dpi=200)
-    except Exception as e:
-        return [], [], f"Error leyendo PDF: {e}"
-
-    items_locales = []
-    resumen_local = []
-    
-    ultimo_numero_factura = "S/N"
-    
-    my_bar = st.progress(0, text=f"Analizando {filename}...")
-
-    for i, img in enumerate(images):
-        data, error = analizar_pagina(img, prompt)
+def generar_excel(df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Inventario')
         
-        if error:
-            st.error(f"Error {filename} Pág {i+1}: {error}")
+        workbook = writer.book
+        worksheet = writer.sheets['Inventario']
+        format_wrap = workbook.add_format({'text_wrap': True})
         
-        elif not data or "copia" in str(data.get("tipo_documento", "")).lower():
-            pass 
-        else:
-            factura_actual = str(data.get("numero_factura", "")).strip()
-            
-            if not factura_actual or factura_actual.lower() in ["none", "null", "continuacion", "pendiente"] or len(factura_actual) < 3:
-                factura_id = ultimo_numero_factura
-            else:
-                factura_id = factura_actual
-                ultimo_numero_factura = factura_actual
-
-            # Guardamos Items
-            if "items" in data and isinstance(data["items"], list):
-                for item in data["items"]:
-                    item["Archivo_Origen"] = filename
-                    item["Factura_Origen"] = factura_id
-                    if "origen" not in item: item["origen"] = "" 
-                    items_locales.append(item)
-            
-            # Guardamos Resumen
-            ya_existe = any(d['Factura'] == factura_id and d['Archivo'] == filename for d in resumen_local)
-            if not ya_existe and factura_id != "S/N":
-                resumen_local.append({
-                    "Archivo": filename,
-                    "Factura": factura_id,
-                    "Total": data.get("total_factura"),
-                    "Cliente": data.get("cliente")
-                })
+        # Ajustar anchos de columna
+        worksheet.set_column('A:A', 15) # Marca
+        worksheet.set_column('B:B', 10) # Cantidad
+        worksheet.set_column('C:C', 15) # Modelo
+        worksheet.set_column('D:D', 45, format_wrap) # Descripción
+        worksheet.set_column('E:G', 15) # Precio, Origen
         
-        my_bar.progress((i + 1) / len(images))
-        time.sleep(0.5) 
+    return output.getvalue()
 
-    my_bar.empty()
-    return resumen_local, items_locales, None
+# --- INTERFAZ PRINCIPAL ---
 
-# ==========================================
-# 🖥️ INTERFAZ
-# ==========================================
+st.title("🏭 Extractor Multi-Marca (Goodyear, Regal, MABE)")
+st.markdown("Extrae inventarios detectando automáticamente la Marca y el Origen, incluso si están solo en el encabezado.")
+
+# Sidebar
 with st.sidebar:
     st.header("Configuración")
-    tipo_pdf = st.selectbox("Plantilla:", list(PROMPTS_POR_TIPO.keys()))
-    st.success("⚡ Motor Groq (Llama 4 Vision)")
+    api_key = st.text_input("Groq API Key", type="password")
 
-uploaded_files = st.file_uploader("Sube Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
+archivo_subido = st.file_uploader("Cargar Factura PDF", type=["pdf"])
 
-if uploaded_files and st.button("🚀 Procesar con Groq"):
-    gran_acumulado = []
-    
-    # Nombre del proveedor para el archivo (se basa en la selección)
-    nombre_proveedor_archivo = "Goodyear" if "Goodyear" in tipo_pdf else "Proveedor"
-    
-    st.divider()
-    for uploaded_file in uploaded_files:
-        with st.expander(f"📄 {uploaded_file.name}", expanded=True):
-            with st.spinner(f"Enviando a Groq LPU..."):
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_file.read())
-                    path = tmp.name
-                    fname = uploaded_file.name
+if archivo_subido and api_key:
+    if st.button("Procesar Factura"):
+        with st.spinner('Detectando Marcas, Orígenes y Productos...'):
+            
+            texto_crudo = extraer_texto_pdf(archivo_subido)
+            respuesta_ia = consultar_groq(texto_crudo, api_key)
+            json_str = limpiar_json_response(respuesta_ia)
+            
+            try:
+                data = json.loads(json_str)
                 
-                resumen, items, error = procesar_pdf(path, fname, tipo_pdf)
-                os.remove(path)
-                
-                if items:
-                    df = pd.DataFrame(items)
-                    st.success(f"✅ {len(items)} items extraídos.")
+                if isinstance(data, list) and len(data) > 0:
+                    df = pd.DataFrame(data)
                     
-                    # Mostrar tabla
-                    cols_to_show = ["modelo", "descripcion", "cantidad", "precio_unitario", "origen", "Factura_Origen"]
-                    # Filtramos solo columnas que existan para evitar errores si cambia el prompt
-                    cols_finales = [c for c in cols_to_show if c in df.columns]
-                    st.dataframe(df[cols_finales], use_container_width=True)
+                    # Reordenar columnas para que Marca salga primero
+                    cols_order = ['marca', 'modelo', 'descripcion', 'cantidad', 'precio_unitario', 'origen', 'factura_origen']
+                    # Aseguramos que existan las columnas antes de reordenar
+                    cols_existentes = [c for c in cols_order if c in df.columns]
+                    df = df[cols_existentes]
                     
-                    gran_acumulado.extend(items)
-                elif error:
-                    st.error(error)
+                    st.success(f"✅ Procesado. Se detectaron productos de: {df['marca'].unique()}")
+                    
+                    st.dataframe(df)
+                    
+                    excel_bytes = generar_excel(df)
+                    st.download_button(
+                        label="📥 Descargar Excel Completo",
+                        data=excel_bytes,
+                        file_name="Inventario_Procesado.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
                 else:
-                    st.warning("⚠️ Sin datos.")
+                    st.warning("No se encontraron datos tablares.")
+                    st.text(respuesta_ia)
+                        
+            except Exception as e:
+                st.error("Error en el formato de respuesta de la IA.")
+                st.text(respuesta_ia)
 
-    if gran_acumulado:
-        st.divider()
-        st.subheader("📥 Zona de Descargas")
-        
-        # 1. Descarga CSV Estándar (Todo junto)
-        df_master = pd.DataFrame(gran_acumulado)
-        csv = df_master.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Descargar CSV Bruto", csv, "extraccion_raw.csv", "text/csv")
-        
-        # 2. Descarga DPR ESPECIAL (Solo si es Goodyear o se solicita)
-        if "Goodyear" in tipo_pdf:
-            fecha_hoy = date.today().strftime("%Y-%m-%d")
-            nombre_archivo_dpr = f"DPR_{nombre_proveedor_archivo}_{fecha_hoy}.xlsx"
-            
-            excel_data = generar_excel_dpr(df_master, nombre_proveedor_archivo)
-            
-            st.download_button(
-                label=f"📄 Descargar Formato DPR ({nombre_archivo_dpr})",
-                data=excel_data,
-                file_name=nombre_archivo_dpr,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+elif archivo_subido and not api_key:
+    st.info("Por favor ingresa tu API Key.")
