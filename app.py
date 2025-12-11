@@ -21,7 +21,7 @@ else:
     st.stop()
 
 # ==========================================
-# 🧠 DEFINICIÓN DE PROMPTS (CON ORIGEN EN GOODYEAR)
+# 🧠 DEFINICIÓN DE PROMPTS (MEJORADO GOODYEAR)
 # ==========================================
 PROMPTS_POR_TIPO = {
     "Factura Internacional (Regal/General)": """
@@ -46,18 +46,18 @@ PROMPTS_POR_TIPO = {
         INSTRUCCIONES CRÍTICAS DE LECTURA:
         1. NÚMERO DE FACTURA:
            - Busca "INVOICE NUMBER" (ej: 300098911).
-           - IMPORTANTE: Si en esta página NO aparece el texto "INVOICE NUMBER", devuelve null o "CONTINUACION".
+           - IMPORTANTE: Si en esta página NO aparece el texto "INVOICE NUMBER" (como en páginas de continuación), devuelve null o "CONTINUACION". ¡NO uses códigos de producto como número de factura!
 
-        2. TABLA DE ITEMS:
-           - Mapeo de columnas:
-             'Code' -> modelo
-             'Origin' -> origen (IMPORTANTE: Extraer el país, ej: Brazil)
-             'Description' -> descripcion
-             'Qty' -> cantidad
-             'Unit Value' -> precio_unitario
+        2. TABLA DE ITEMS (LAYOUT COMPLEJO):
+           - Caso Normal (Pág 1): Todo en una línea.
+           - Caso Roto (Pág 2+): La información del item se divide en dos líneas.
+             Linea A: "215/60R17 EFFIGRIP SUV..." (Esto es la DESCRIPCIÓN)
+             Linea B: "40.000   111530   68.93..." (Esto es: Cantidad, CÓDIGO, Precio)
            
-           - MANEJO DE SALTOS DE LÍNEA (Páginas rotas):
-             Si la info está en dos líneas (Linea A: Descripción, Linea B: Datos numéricos), únelas lógicamente.
+           - TU TAREA: Si ves este formato roto, reconstruye el item:
+             - 'modelo': Extrae el número de 6 dígitos de la segunda línea (ej: 111530).
+             - 'descripcion': Extrae el texto de la primera línea.
+             - 'cantidad': El primer número de la segunda línea.
 
         Responde SOLAMENTE con este JSON:
         {
@@ -70,7 +70,6 @@ PROMPTS_POR_TIPO = {
             "items": [
                 {
                     "modelo": "...",
-                    "origen": "País de Origen (ej: Brazil)", 
                     "descripcion": "...",
                     "cantidad": 0,
                     "precio_unitario": 0.00,
@@ -135,6 +134,7 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
     items_locales = []
     resumen_local = []
     
+    # VARIABLE PARA ARRASTRAR EL NÚMERO DE FACTURA ENTRE PÁGINAS
     ultimo_numero_factura = "S/N"
     
     my_bar = st.progress(0, text=f"Analizando {filename}...")
@@ -145,28 +145,29 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
         if error:
             st.error(f"Error {filename} Pág {i+1}: {error}")
         
+        # Filtro de Copias
         elif not data or "copia" in str(data.get("tipo_documento", "")).lower():
             pass 
         else:
+            # LÓGICA INTELIGENTE DE FACTURA
             factura_actual = str(data.get("numero_factura", "")).strip()
             
-            # Lógica de continuidad de factura
+            # Si la IA no encontró factura o dice "CONTINUACION", usamos la de la página anterior
             if not factura_actual or factura_actual.lower() in ["none", "null", "continuacion", "pendiente"] or len(factura_actual) < 3:
                 factura_id = ultimo_numero_factura
             else:
                 factura_id = factura_actual
-                ultimo_numero_factura = factura_actual
+                ultimo_numero_factura = factura_actual # Actualizamos para las siguientes páginas
 
-            # Guardamos Items (Ahora con Origen)
+            # Guardamos Items
             if "items" in data and isinstance(data["items"], list):
                 for item in data["items"]:
                     item["Archivo_Origen"] = filename
                     item["Factura_Origen"] = factura_id
-                    # Aseguramos que el campo exista aunque venga vacío
-                    if "origen" not in item: item["origen"] = "" 
                     items_locales.append(item)
             
-            # Guardamos Resumen
+            # Guardamos Resumen (Solo si encontramos una factura nueva o es la pág 1)
+            # Evitamos duplicados en la tabla resumen
             ya_existe = any(d['Factura'] == factura_id and d['Archivo'] == filename for d in resumen_local)
             if not ya_existe and factura_id != "S/N":
                 resumen_local.append({
@@ -209,9 +210,7 @@ if uploaded_files and st.button("🚀 Procesar con Groq"):
                 if items:
                     df = pd.DataFrame(items)
                     st.success(f"✅ {len(items)} items extraídos.")
-                    # Reordenar columnas para ver el origen mejor
-                    columnas = [c for c in df.columns if c not in ["Archivo_Origen", "Factura_Origen"]]
-                    st.dataframe(df[columnas + ["origen", "Archivo_Origen", "Factura_Origen"]], use_container_width=True)
+                    st.dataframe(df, use_container_width=True)
                     gran_acumulado.extend(items)
                 elif error:
                     st.error(error)
