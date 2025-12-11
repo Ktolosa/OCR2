@@ -78,6 +78,40 @@ PROMPTS_POR_TIPO = {
             "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "total_linea": 0.0}],
             "total_factura": 0.0
         }
+    """,
+    "Factura Goodyear": """
+        Analiza esta factura de Goodyear International Corporation.
+        
+        INSTRUCCIONES ESPECÍFICAS:
+        1. Busca el Número de Factura bajo el texto 'INVOICE NUMBER' (suele estar abajo a la izquierda en la pág 1).
+        2. La tabla de items tiene columnas: 'Qty', 'Code', 'Unit Value', 'Total Value'.
+        3. Mapeo de columnas:
+           - 'Code' -> modelo
+           - 'Description' -> descripcion
+           - 'Qty' -> cantidad
+           - 'Unit Value' -> precio_unitario
+           - 'Total Value' -> total_linea
+        4. El total final suele estar como 'Invoice Total'.
+
+        Responde SOLAMENTE con este JSON:
+        {
+            "tipo_documento": "Original",
+            "numero_factura": "...",
+            "fecha": "...",
+            "orden_compra": "Buscar Purchase Order en la tabla o encabezado",
+            "proveedor": "Goodyear International Corporation",
+            "cliente": "...",
+            "items": [
+                {
+                    "modelo": "...",
+                    "descripcion": "...",
+                    "cantidad": 0,
+                    "precio_unitario": 0.00,
+                    "total_linea": 0.00
+                }
+            ],
+            "total_factura": 0.00
+        }
     """
 }
 
@@ -114,11 +148,10 @@ def analizar_pagina(image, prompt_sistema):
                     ],
                 }
             ],
-            # --- AQUÍ ESTÁ EL CAMBIO IMPORTANTE ---
+            # Modelo Llama 4 Scout (Visión)
             model="meta-llama/llama-4-scout-17b-16e-instruct", 
-            # --------------------------------------
             temperature=0.1,
-            max_tokens=4096, # Aumentado para respuestas largas
+            max_tokens=4096,
             top_p=1,
             stream=False,
             response_format={"type": "json_object"}, 
@@ -174,13 +207,15 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
                     item["Factura_Origen"] = factura_id
                     items_locales.append(item)
             
-            # Guardamos resumen
-            resumen_local.append({
-                "Archivo": filename,
-                "Factura": factura_id,
-                "Total": data.get("total_factura"),
-                "Cliente": data.get("cliente")
-            })
+            # Guardamos resumen (Evitamos duplicar si la factura tiene varias páginas y repite cabecera)
+            # Solo agregamos al resumen si aún no hemos registrado esta factura para este archivo
+            if not any(d['Factura'] == factura_id and d['Archivo'] == filename for d in resumen_local):
+                 resumen_local.append({
+                    "Archivo": filename,
+                    "Factura": factura_id,
+                    "Total": data.get("total_factura"),
+                    "Cliente": data.get("cliente")
+                })
         
         # Actualizar barra
         my_bar.progress((i + 1) / len(images))
